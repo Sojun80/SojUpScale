@@ -20,15 +20,20 @@ sudo thed1-netclose
 ## Run
 
 ```bash
-python3 ~/VideoUpscale/upscale.py SRC.mkv --work ~/VideoUpscale-work/test1 --start 830 --duration 20 --gpus 2
+python3 ~/VideoUpscale/upscale.py SRC.mkv --work ~/VideoUpscale-work/full           # whole file, all 4 GPUs
+python3 ~/VideoUpscale/upscale.py SRC.mkv --work ~/VideoUpscale-work/t --start 830 --duration 20
 ```
+
+**Segments:** the range is split into segments of about `--segment-seconds` (60 s by default). A join snaps to a scene cut when one is within 15 s of the target, so it doesn't show. The x265 encode of each segment runs on the CPU while the GPUs work on the next segment, and its PNGs are deleted afterwards. That's needed because upstream keeps every frame in RAM as float32, about 575 GB for a 17-minute 1440×1080 video. **Resume** by rerunning with the same `--work`: segments marked `done` are skipped.
 
 Output in the work dir:
 
-- `upscaled.mkv`: x265 10-bit, BT.709 tagged, with the source audio
-- `compare.mp4`: Lanczos on the left, SeedVR2 on the right
-- `stills/`: three frames from the comparison
-- `timing.json`, `seedvr2.log`
+- `upscaled.mkv`: x265 10-bit, BT.709 tagged, with the source audio (stream-copied for a whole file)
+- `compare.mp4`: Lanczos on the left, SeedVR2 on the right; made automatically for ranges up to 120 s
+- `segments.json`: the scene cuts and segment plan
+- `timing.json`, and `segNNN/seedvr2.log` per segment
+
+**Measured on thed1:** 20 s of 720×480 → 1440×1080 with 7B FP16 took 841 s on one GPU (batch 21) and 260 s on four (batch 45, 8 GiB VAE patch). That's 2.3 fps.
 
 ## What the pipeline does with SD
 
