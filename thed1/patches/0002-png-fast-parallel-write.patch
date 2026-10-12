@@ -1,0 +1,32 @@
+diff --git a/inference_cli.py b/inference_cli.py
+index 2d4fff1..2e2fbe3 100644
+--- a/inference_cli.py
++++ b/inference_cli.py
+@@ -730,7 +730,7 @@ def _save_image_bgr(frame_np: np.ndarray, file_path: str) -> None:
+         frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGBA2BGRA)
+     else:
+         frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+-    cv2.imwrite(file_path, frame_bgr)
++    cv2.imwrite(file_path, frame_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+ 
+ 
+ def save_frames_to_video(
+@@ -813,12 +813,12 @@ def save_frames_to_image(
+         debug.log(f"Saving {total} frames as PNGs to directory: {output_dir}", category="file")
+     digits = 6  # Supports up to 999,999 frames (~11.5 hours at 24fps)
+ 
+-    for idx, frame in enumerate(frames_np):
+-        filename = f"{base_name}_{start_index + idx:0{digits}d}.png"
+-        file_path = os.path.join(output_dir, filename)
+-        _save_image_bgr(frame, file_path)
+-        if debug.enabled and (idx + 1) % 100 == 0:
+-            debug.log(f"Saved {idx + 1}/{total} images", category="file")
++    # OpenCV releases the GIL while encoding, so threads write PNGs in parallel.
++    from concurrent.futures import ThreadPoolExecutor
++    paths = [os.path.join(output_dir, f"{base_name}_{start_index + idx:0{digits}d}.png")
++             for idx in range(total)]
++    with ThreadPoolExecutor(max_workers=16) as pool:
++        list(pool.map(_save_image_bgr, frames_np, paths))
+ 
+     debug.log(f"Saved {total} images to '{output_dir}'", category="success")
+     return total
