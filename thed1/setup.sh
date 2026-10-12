@@ -30,19 +30,29 @@ if [[ "$(git -C "$DEPS/seedvr2" rev-parse HEAD)" != "$UPSTREAM_REV" ]]; then
   git -C "$DEPS/seedvr2" -c advice.detachedHead=false checkout -q "$UPSTREAM_REV"
 fi
 log "upstream at $(git -C "$DEPS/seedvr2" rev-parse --short HEAD)"
+# Our patches (thed1/patches/*.patch), reapplied from a clean tree every run.
+git -C "$DEPS/seedvr2" checkout -q -- .
+for p in "$HERE"/patches/*.patch; do
+  git -C "$DEPS/seedvr2" apply "$p"
+  log "applied $(basename "$p")"
+done
 
 # --- venv --------------------------------------------------------------------
-if [[ ! -x "$DEPS/venv/bin/python" ]]; then
-  log "creating venv"
-  python3 -m venv "$DEPS/venv"
+# Installed once; rerun with VIDEOUPSCALE_REINSTALL=1 (and the network open) to redo.
+if [[ ! -f "$DEPS/venv/.installed" || -n "${VIDEOUPSCALE_REINSTALL:-}" ]]; then
+  if [[ ! -x "$DEPS/venv/bin/python" ]]; then
+    log "creating venv"
+    python3 -m venv "$DEPS/venv"
+  fi
+  PIP="$DEPS/venv/bin/pip"
+  "$PIP" install -q --upgrade pip
+  "$PIP" install -q torch==2.13.0 torchvision==0.28.0 --index-url "$TORCH_INDEX"
+  # Headless OpenCV: the desktop build wants libGL, which this server doesn't need.
+  grep -v '^opencv-python' "$DEPS/seedvr2/requirements.txt" > "$DEPS/requirements.thed1.txt"
+  echo opencv-python-headless >> "$DEPS/requirements.thed1.txt"
+  "$PIP" install -q -r "$DEPS/requirements.thed1.txt"
+  touch "$DEPS/venv/.installed"
 fi
-PIP="$DEPS/venv/bin/pip"
-"$PIP" install -q --upgrade pip
-"$PIP" install -q torch==2.13.0 torchvision==0.28.0 --index-url "$TORCH_INDEX"
-# Headless OpenCV: the desktop build wants libGL, which this server doesn't need.
-grep -v '^opencv-python' "$DEPS/seedvr2/requirements.txt" > "$DEPS/requirements.thed1.txt"
-echo opencv-python-headless >> "$DEPS/requirements.thed1.txt"
-"$PIP" install -q -r "$DEPS/requirements.thed1.txt"
 "$DEPS/venv/bin/python" -c 'import torch; print("[setup] torch", torch.__version__, "cuda", torch.cuda.is_available(), torch.cuda.device_count(), "GPUs")'
 
 # --- models ------------------------------------------------------------------

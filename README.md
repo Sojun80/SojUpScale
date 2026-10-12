@@ -13,6 +13,10 @@ sudo thed1-netopen 2h
 sudo thed1-netclose
 ```
 
+`setup.sh` also applies `thed1/patches/*.patch` to the upstream checkout. Rerunning it is safe with the network closed; set `VIDEOUPSCALE_REINSTALL=1` to redo the pip installs.
+
+**Patches:** `0001` raises the 7B VAE's conv/norm memory limits from 0.5 to 8 GiB. The 0.5 GiB default splits every layer into small pieces for small cards. With 64 GB cards, 8 GiB makes encode + decode about 13% faster: 4.17 + 9.21 s instead of 4.72 + 10.65 s per 21-frame 1440×1080 batch on a CMP 170HX. VAE peak goes from 26 to 39 GiB. `bench/vae_bench.py` measures this. cuDNN benchmark mode, the normal Conv3d path and channels-last didn't help (channels-last was 1.6× slower).
+
 ## Run
 
 ```bash

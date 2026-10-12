@@ -1,0 +1,15 @@
+diff --git a/configs_7b/main.yaml b/configs_7b/main.yaml
+index ac66e9a..5b77d32 100644
+--- a/configs_7b/main.yaml
++++ b/configs_7b/main.yaml
+@@ -51,8 +51,8 @@ vae:
+     split_size: 4
+     memory_device: same
+   memory_limit:
+-    conv_max_mem: 0.5
+-    norm_max_mem: 0.5
++    conv_max_mem: 8.0
++    norm_max_mem: 8.0
+   checkpoint: ema_vae_fp16.safetensors
+   scaling_factor: 0.9152
+   compile: False
