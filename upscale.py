@@ -32,7 +32,8 @@ def run(cmd, log=None):
         return
     with open(log, "w") as f:
         proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                env={**os.environ, "PYTHONUNBUFFERED": "1"})
         for line in proc.stdout:
             sys.stdout.write(line)
             f.write(line)
