@@ -60,6 +60,13 @@ def main():
     if a.channels_last:
         model = model.to(memory_format=torch.channels_last_3d)
 
+    # Upstream's OOM retry needs a debug logger on each module; give it a silent one.
+    class _Quiet:
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+    for m in model.modules():
+        m.debug = _Quiet()
+
     mem = lambda s: None if s == "inf" else float(s)
     model.set_memory_limit(conv_max_mem=mem(a.conv_mem), norm_max_mem=mem(a.norm_mem))
     if a.split_size != "none":
@@ -91,6 +98,7 @@ def main():
                   f"decode {td:6.2f} s (peak {peak_d:5.1f} GiB)  latent {tuple(z.shape)} out {tuple(y.shape)}",
                   flush=True)
             del z, y
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
