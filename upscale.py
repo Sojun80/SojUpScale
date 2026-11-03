@@ -1,37 +1,86 @@
 #!/usr/bin/env python3
-"""Upscale old SD video with SeedVR2.
+"""Restore and upscale old SD video (SeedVR2 by default).
 
-The source range is split into segments (about --segment-seconds long, cut at
-scene changes where one is close so the joins don't show). Each segment:
-  1. prep     exact frame range, square pixels, lossless H.264
-  2. seedvr2  the upstream CLI, PNG frames out (8-bit RGB)
-  3. encode   RGB -> BT.709 10-bit x265 (on the CPU, overlapping the next
-              segment's SeedVR2 run); its PNGs are deleted afterwards
-Then the segments are joined and the source audio muxed back, and for short
-ranges a Lanczos-vs-SeedVR2 side-by-side is made.
+Planning (CPU, before any GPU work):
+  * scene cuts split the range into shots; the model never sees across a cut
+  * shots longer than --max-piece-seconds are split into overlapping pieces
+    that are crossfaded (or, between jobs, cut mid-overlap with context)
+  * consecutive shots are grouped into jobs of about --segment-seconds
+Processing:
+  * one worker per GPU loads the model once and takes jobs from a queue
+    (WORK/queue); each job's frames are written as 16-bit PNGs
+  * finished jobs are encoded to BT.709 10-bit x265 on the CPU while the GPUs
+    continue, and their PNGs are deleted
+  * the jobs are joined, the source audio muxed back, and for short ranges a
+    Lanczos-vs-restored side-by-side is made
 
-Rerunning with the same --work resumes: finished segments are skipped.
+Resume by rerunning with the same --work. WORK/manifest.json records the source
+content, range and every setting that affects the pixels; a rerun with anything
+different is refused instead of silently mixing results (--restart discards).
 
-Interlaced or telecined sources are refused for now: deinterlacing/IVTC is
-not implemented yet, and feeding combed frames to the model bakes combing in.
+Interlaced or telecined sources are refused unless --deinterlace is given (or
+--allow-interlaced): combed frames fed to the model get the combing baked in.
 
-Stdlib only; runs on thed1 with the venv and models from thed1/setup.sh.
+Stdlib only; engines run in their own interpreter (SeedVR2: the deps venv from
+thed1/setup.sh).
 """
 import argparse
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
-from fractions import Fraction
 from pathlib import Path
 
+REPO = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO))
+from sojupscale import manifest, media, plan  # noqa: E402
+
 DEPS = Path(os.environ.get("VIDEOUPSCALE_DEPS", Path.home() / "VideoUpscale-deps"))
-SCENE_THRESHOLD = 10      # ffmpeg scdet score (0-100) that counts as a cut
-SCENE_WINDOW = 0.25       # look for a cut within this fraction of a segment of the target
 COMPARE_MAX_SECONDS = 120
+
+
+def seedvr2_version():
+    m = re.search(r"^ENGINE_VERSION = (\d+)", (REPO / "engines/seedvr2_runner.py").read_text(), re.M)
+    rev = subprocess.run(["git", "-C", str(DEPS / "seedvr2"), "rev-parse", "HEAD"],
+                         capture_output=True, text=True).stdout.strip() or "missing"
+    return dict(runner=int(m.group(1)), upstream=rev,
+                patches=manifest.tree_hash((REPO / "thed1/patches").glob("*.patch")))
+
+
+def model_id(name):
+    """sha256 from thed1/models.txt (setup.sh verifies downloads against it)."""
+    for line in (REPO / "thed1/models.txt").read_text().splitlines():
+        parts = line.split()
+        if parts and parts[0] == name:
+            return parts[2]
+    p = DEPS / "models/SEEDVR2" / name
+    return f"size:{p.stat().st_size}" if p.exists() else "unknown"
+
+
+ENGINES = {
+    "seedvr2": dict(python=lambda: DEPS / "venv/bin/python", runner="seedvr2_runner.py", gpu=True),
+    "lanczos": dict(python=lambda: sys.executable, runner="lanczos_runner.py", gpu=False),
+}
+
+
+def engine_settings(a):
+    if a.engine == "seedvr2":
+        return dict(model=a.model, model_sha256=model_id(a.model), batch_size=a.batch_size,
+                    overlap=a.overlap, balanced_batches=not a.no_balanced_batches,
+                    color_correction=a.color_correction, attention=a.attention, seed=a.seed,
+                    prepend_frames=a.prepend_frames, input_noise=a.input_noise,
+                    latent_noise=a.latent_noise, compile=a.compile, version=seedvr2_version())
+    return dict(version=subprocess.run(["ffmpeg", "-version"], capture_output=True,
+                                       text=True).stdout.split("\n")[0])
+
+
+# Settings that only change speed or logging, kept out of the resume identity.
+NON_PIXEL_SETTINGS = {"compile"}
 
 
 def show(cmd):
@@ -39,257 +88,364 @@ def show(cmd):
     return [str(c) for c in cmd]
 
 
-def run(cmd, log=None):
-    cmd = show(cmd)
-    if log is None:
-        subprocess.run(cmd, check=True)
-        return
-    with open(log, "w") as f:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                bufsize=1, env={**os.environ, "PYTHONUNBUFFERED": "1"})
-        for line in proc.stdout:
-            sys.stdout.write(line)
-            f.write(line)
-        if proc.wait() != 0:
-            sys.exit(f"command failed ({proc.returncode}), see {log}")
+def run(cmd):
+    subprocess.run(show(cmd), check=True)
 
 
-def probe(path):
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries",
-         "stream=width,height,sample_aspect_ratio,r_frame_rate,nb_read_packets",
-         "-of", "json", str(path)], check=True, capture_output=True, text=True).stdout
-    s = json.loads(out)["streams"][0]
-    sar = s.get("sample_aspect_ratio", "1:1")
-    sar = Fraction(1) if sar in ("0:1", "N/A") else Fraction(*map(int, sar.split(":")))
-    has_audio = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
-         "stream=index", "-of", "csv=p=0", str(path)],
-        check=True, capture_output=True, text=True).stdout.strip() != ""
-    return dict(w=s["width"], h=s["height"], sar=sar, fps=Fraction(s["r_frame_rate"]),
-                frames=int(s["nb_read_packets"]), audio=has_audio)
+def write_json(path, obj):
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=1))
+    os.replace(tmp, path)
 
 
-def frame_count(path):
-    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
-                          "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)],
-                         capture_output=True, text=True).stdout.strip()
-    return int(out) if out.isdigit() else -1
+WORK_ITEMS = ["manifest.json", "plan.json", "queue", "running", "jobs", "workers", "progress.json",
+              "timing.json", "video.mkv", "upscaled.mkv", "compare.mp4", "segments.txt", "cancel",
+              "segments.json"]
 
 
-def interlace_check(src, start):
-    """Fraction of frames idet calls interlaced, over 30 s from `start`."""
-    r = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-nostats", "-ss", str(start), "-i", str(src), "-t", "30",
-         "-an", "-vf", "idet", "-f", "null", "-"], capture_output=True, text=True)
-    for line in r.stderr.splitlines():
-        if "Multi frame detection" in line:
-            nums = [int(t) for t in line.split() if t.isdigit()]
-            tff, bff, prog = nums[0], nums[1], nums[2]
-            return (tff + bff) / max(1, tff + bff + prog)
-    return 0.0
+def restart(work):
+    """Delete what this script creates in WORK (never anything else)."""
+    for name in WORK_ITEMS:
+        p = work / name
+        if p.is_dir():
+            shutil.rmtree(p)
+        elif p.exists():
+            p.unlink()
+    for p in work.glob("seg[0-9][0-9][0-9]"):  # older versions' segments
+        shutil.rmtree(p)
 
 
-def scene_cuts(src, fps, first, last):
-    """Frame numbers (absolute) where a new shot starts, within [first, last)."""
-    r = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{seek_time(first, fps):.6f}", "-i", str(src),
-         "-frames:v", str(last - first), "-an", "-vf", f"scdet=threshold={SCENE_THRESHOLD}",
-         "-f", "null", "-"], capture_output=True, text=True)
-    times = [float(t) for t in re.findall(r"lavfi\.scd\.time:\s*([\d.]+)", r.stderr)]
-    return sorted({first + round(t * fps) for t in times})
-
-
-def plan_segments(first, last, seg_frames, cuts):
-    """Split [first, last) into pieces near seg_frames long, snapping ends to scene cuts."""
-    bounds = [first]
-    window = int(seg_frames * SCENE_WINDOW)
-    while last - bounds[-1] > seg_frames + window:
-        target = bounds[-1] + seg_frames
-        near = [c for c in cuts if abs(c - target) <= window and c - bounds[-1] > window]
-        bounds.append(min(near, key=lambda c: abs(c - target)) if near else target)
-    bounds.append(last)
-    return list(zip(bounds[:-1], bounds[1:]))
-
-
-def seek_time(frame, fps):
-    # Half a frame early, so the seek lands exactly on `frame` despite timestamp rounding.
-    return 0.0 if frame == 0 else float((frame - Fraction(1, 2)) / fps)
-
-
-def even(x):
-    return int(round(x / 2)) * 2
-
-
-def square_size(info):
-    """Square-pixel size, never throwing away source pixels."""
-    w, h, sar = info["w"], info["h"], info["sar"]
-    if sar >= 1:
-        return even(w * sar), h
-    return w, even(h / sar)
-
-
-def prep_cmd(src, fps, sq, start, n, out):
-    # Untagged SD: decoded as BT.601 (ffmpeg's default for SD), 4:2:0 kept, lossless so the
-    # model sees exactly the source pixels, rescaled to square.
-    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{seek_time(start, fps):.6f}",
-            "-i", src, "-frames:v", n, "-map", "0:v:0", "-an",
-            "-vf", f"scale={sq[0]}:{sq[1]}:flags=lanczos,setsar=1",
-            "-c:v", "libx264", "-qp", "0", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-            "-color_primaries", "smpte170m", "-color_trc", "smpte170m", "-colorspace", "smpte170m", out]
-
-
-def encode_cmd(frame_dir, fps, crf, out):
-    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-framerate", fps,
-            "-pattern_type", "glob", "-i", f"{frame_dir}/*.png",
-            "-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p10le",
-            "-c:v", "libx265", "-crf", crf, "-preset", "slow",
-            "-x265-params", "colorprim=bt709:transfer=bt709:colormatrix=bt709:log-level=warning",
-            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-            "-color_range", "tv", out]
-
-
-def frame_dir_of(frames):
-    pngs = sorted(frames.rglob("*.png"))
-    dirs = {p.parent for p in pngs}
-    if len(dirs) != 1:
-        sys.exit(f"expected PNG frames in one directory under {frames}, found {len(pngs)} in {dirs}")
-    return dirs.pop(), len(pngs)
-
-
-def main():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("src")
     ap.add_argument("--work", required=True, help="work/output directory (reuse it to resume)")
     ap.add_argument("--start", type=float, default=0, help="range start, seconds")
     ap.add_argument("--duration", type=float, default=0, help="range length, seconds (0 = to end)")
-    ap.add_argument("--segment-seconds", type=float, default=60)
     ap.add_argument("--height", type=int, default=1080, help="output height (short side)")
-    ap.add_argument("--model", default="seedvr2_ema_7b_fp16.safetensors")
-    ap.add_argument("--gpus", default="0,1,2,3", help="CUDA device list, e.g. 2 or 0,1,2,3")
-    ap.add_argument("--batch-size", type=int, default=45, help="frames per batch, 4n+1")
-    ap.add_argument("--overlap", type=int, default=3, help="temporal overlap between batches/GPUs")
-    ap.add_argument("--color-correction", default="lab")
-    ap.add_argument("--attention", default="sdpa")
-    ap.add_argument("--crf", type=int, default=16)
-    ap.add_argument("--compare", choices=["auto", "yes", "no"], default="auto",
-                    help=f"side-by-side video (auto: ranges up to {COMPARE_MAX_SECONDS} s)")
-    ap.add_argument("--keep-frames", action="store_true", help="keep each segment's PNGs")
-    ap.add_argument("--allow-interlaced", action="store_true")
-    a = ap.parse_args()
-
+    ap.add_argument("--engine", choices=sorted(ENGINES), default="seedvr2")
+    g = ap.add_argument_group("planning")
+    g.add_argument("--segment-seconds", type=float, default=20,
+                   help="job length: frames one GPU processes and encodes in one go")
+    g.add_argument("--max-piece-seconds", type=float, default=20,
+                   help="longest piece per model call (RAM: ~20 GB per GPU worker for 20 s at 1080p)")
+    g.add_argument("--piece-overlap", type=int, default=12,
+                   help="frames shared by consecutive pieces of a long shot (crossfaded)")
+    g.add_argument("--scene-threshold", type=float, default=10, help="ffmpeg scdet score that counts as a cut")
+    g.add_argument("--deinterlace", choices=sorted(media.DEINTERLACE), default="none")
+    g.add_argument("--allow-interlaced", action="store_true", help="process interlaced input as is")
+    g = ap.add_argument_group("SeedVR2")
+    g.add_argument("--model", default="seedvr2_ema_7b_fp16.safetensors")
+    g.add_argument("--gpus", default="0,1,2,3", help="CUDA devices, one worker each, e.g. 2 or 0,1,2,3")
+    g.add_argument("--batch-size", type=int, default=45, help="max frames per batch, 4n+1")
+    g.add_argument("--overlap", type=int, default=3, help="frames shared by consecutive batches")
+    g.add_argument("--no-balanced-batches", action="store_true",
+                   help="use --batch-size as is (short last batch per piece), like upstream")
+    g.add_argument("--color-correction", default="lab",
+                   choices=["lab", "wavelet", "wavelet_adaptive", "hsv", "adain", "none"])
+    g.add_argument("--attention", default="sdpa")
+    g.add_argument("--seed", type=int, default=42)
+    g.add_argument("--prepend-frames", type=int, default=0, help="mirrored frames before each piece")
+    g.add_argument("--input-noise", type=float, default=0.0, help="upstream input_noise_scale")
+    g.add_argument("--latent-noise", type=float, default=0.0, help="upstream latent_noise_scale")
+    g.add_argument("--compile", action="store_true", help="torch.compile DiT and VAE (speed only)")
+    g = ap.add_argument_group("output")
+    g.add_argument("--png-depth", type=int, choices=[8, 16], default=16, help="intermediate frame depth")
+    g.add_argument("--crf", type=int, default=16)
+    g.add_argument("--x265-preset", default="slow")
+    g.add_argument("--encoders", type=int, default=1, help="x265 encodes running at once")
+    g.add_argument("--workers", type=int, default=1, help="workers for CPU engines")
+    g.add_argument("--compare", choices=["auto", "yes", "no"], default="auto",
+                   help=f"side-by-side video (auto: ranges up to {COMPARE_MAX_SECONDS} s)")
+    g.add_argument("--keep-frames", action="store_true", help="keep each job's PNGs")
+    g.add_argument("--restart", action="store_true", help="discard this work directory's results first")
+    a = ap.parse_args(argv)
     if (a.batch_size - 1) % 4:
-        sys.exit("--batch-size must be 4n+1 (1, 5, 9, 13, 17, 21, ...)")
+        ap.error("--batch-size must be 4n+1 (1, 5, 9, 13, 17, 21, ...)")
+    if not 0 <= a.overlap < a.batch_size:
+        ap.error("--overlap must be smaller than --batch-size")
+    return a
+
+
+class Abort(Exception):
+    pass
+
+
+class Workers:
+    """Engine worker processes, their output streamed live with a prefix and
+    copied to WORK/workers/<name>.log."""
+
+    def __init__(self):
+        self.procs = {}
+
+    def start(self, name, cmd, env, log_path):
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                bufsize=1, env=env)
+
+        def pump():
+            with open(log_path, "a") as f:
+                for line in proc.stdout:
+                    sys.stdout.write(f"[{name}] {line}")
+                    f.write(line)
+                    f.flush()
+
+        t = threading.Thread(target=pump, daemon=True)
+        t.start()
+        self.procs[name] = (proc, t)
+
+    def poll(self):
+        """Names of workers that exited with an error; finished ones are dropped."""
+        failed = []
+        for name, (proc, t) in list(self.procs.items()):
+            rc = proc.poll()
+            if rc is not None:
+                t.join(timeout=5)
+                del self.procs[name]
+                if rc != 0:
+                    failed.append(f"{name} (exit {rc})")
+        return failed
+
+    def stop(self):
+        for proc, _ in self.procs.values():
+            if proc.poll() is None:
+                proc.terminate()
+        for proc, _ in self.procs.values():
+            try:
+                proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+
+def job_spec(i, job, work, src, info, sq, out, a, settings):
+    return dict(id=f"j{i:03d}", dir=str(work / "jobs" / f"j{i:03d}"), pieces=job,
+                source=dict(path=str(src), square=list(sq), deinterlace=a.deinterlace,
+                            info=dict(w=info["w"], h=info["h"], fps=str(info["fps"]),
+                                      matrix=info["matrix"], range=info["range"])),
+                output=dict(size=list(out), png_depth=a.png_depth),
+                engine=dict(name=a.engine, settings=settings))
+
+
+def progress(work, jobs, state, t0, frames_total, extra=None):
+    done = 0
+    for i in range(len(jobs)):
+        d = work / "jobs" / f"j{i:03d}"
+        if (d / "encoded").exists():
+            done += sum(len(plan.written_frames(p)) for p in jobs[i])
+            continue
+        for m in (d / "pieces").glob("p*.json") if (d / "pieces").exists() else []:
+            try:
+                done += json.loads(m.read_text())["frames"]
+            except (ValueError, KeyError, OSError):
+                pass
+    elapsed = time.time() - t0
+    p = dict(state=state, frames_total=frames_total, frames_done=min(done, frames_total),
+             fraction=round(min(done, frames_total) / max(1, frames_total), 4), elapsed_s=round(elapsed),
+             updated=time.strftime("%Y-%m-%dT%H:%M:%S"), **(extra or {}))
+    write_json(work / "progress.json", p)
+    return p
+
+
+def main(argv=None):
+    a = parse_args(argv)
     src = Path(a.src).resolve()
     work = Path(a.work).expanduser().resolve()
     work.mkdir(parents=True, exist_ok=True)
-    info = probe(src)
+    if a.restart:
+        restart(work)
+    (work / "cancel").unlink(missing_ok=True)
+    eng = ENGINES[a.engine]
+
+    info = media.probe(src)
     fps = info["fps"]
-    sq = square_size(info)
-    out_h = a.height
-    out_w = even(sq[0] * out_h / sq[1])
+    sq = media.square_size(info["w"], info["h"], info["sar"])
+    out = media.output_size(sq, a.height)
     first = round(a.start * fps)
     last = min(info["frames"], first + round(a.duration * fps)) if a.duration else info["frames"]
-    print(f"source {info['w']}x{info['h']} SAR {info['sar']} @ {fps} ({info['frames']} frames) -> "
-          f"square {sq[0]}x{sq[1]} -> output {out_w}x{out_h}; range frames {first}-{last}", flush=True)
+    if last <= first:
+        sys.exit("empty range")
+    job_frames = max(1, round(a.segment_seconds * fps))
+    max_piece = max(1, round(a.max_piece_seconds * fps))
+    if job_frames < max_piece:
+        sys.exit("--segment-seconds must be >= --max-piece-seconds")
+    if not 0 <= a.piece_overlap <= max_piece // 4:
+        sys.exit("--piece-overlap must be between 0 and a quarter of a piece")
+    print(f"source {info['w']}x{info['h']} SAR {info['sar']} @ {fps} ({info['frames']} frames, "
+          f"{info['matrix']}{'' if info['matrix_tagged'] else ' assumed'}, {info['range']} range) -> "
+          f"square {sq[0]}x{sq[1]} -> output {out[0]}x{out[1]}; range frames {first}-{last}", flush=True)
 
-    plan_file = work / "segments.json"
+    settings = engine_settings(a)
+    identity = dict(
+        source=manifest.file_id(src), range=[first, last], square=list(sq), output=list(out),
+        matrix=info["matrix"], color_range=info["range"], deinterlace=a.deinterlace,
+        plan=dict(job_frames=job_frames, max_piece=max_piece, piece_overlap=a.piece_overlap,
+                  scene_threshold=a.scene_threshold),
+        engine=a.engine, settings={k: v for k, v in settings.items() if k not in NON_PIXEL_SETTINGS},
+        png_depth=a.png_depth, encode=dict(crf=a.crf, preset=a.x265_preset))
+    try:
+        manifest.ensure(work, identity)
+    except manifest.Mismatch as e:
+        sys.exit(str(e))
+
+    plan_file = work / "plan.json"
     if plan_file.exists():
-        plan = json.loads(plan_file.read_text())
-        if (plan["first"], plan["last"]) != (first, last):
-            sys.exit(f"{work} holds a different range ({plan['first']}-{plan['last']}); use a new --work")
-        segments = [tuple(s) for s in plan["segments"]]
+        p = json.loads(plan_file.read_text())
+        jobs, cuts = p["jobs"], p["scene_cuts"]
     else:
-        ratio = interlace_check(src, a.start)
-        print(f"idet: {ratio:.1%} of frames interlaced", flush=True)
-        if ratio > 0.05 and not a.allow_interlaced:
-            sys.exit("source looks interlaced/telecined; deinterlace first (not implemented yet) "
-                     "or pass --allow-interlaced")
-        cuts = scene_cuts(src, fps, first, last)
-        segments = plan_segments(first, last, round(a.segment_seconds * fps), cuts)
-        plan_file.write_text(json.dumps(dict(first=first, last=last, scene_cuts=cuts,
-                                             segments=segments), indent=1))
-    print(f"{len(segments)} segments: " + ", ".join(f"{s}-{e}" for s, e in segments), flush=True)
+        if a.deinterlace == "none" and not a.allow_interlaced:
+            ratio = media.interlace_check(src, a.start)
+            print(f"idet: {ratio:.1%} of frames interlaced", flush=True)
+            if ratio > 0.05:
+                sys.exit("source looks interlaced/telecined; use --deinterlace bwdif (video) or "
+                         "--deinterlace fieldmatch (telecined film), or --allow-interlaced")
+        cuts = media.scene_cuts(src, fps, first, last, a.scene_threshold)
+        jobs = plan.plan_jobs(first, last, cuts, job_frames, max_piece, a.piece_overlap)
+        plan.check(jobs, first, last, cuts)
+        write_json(plan_file, dict(first=first, last=last, scene_cuts=cuts, jobs=jobs))
+    n_pieces = sum(len(j) for j in jobs)
+    print(f"{len(cuts)} scene cuts, {n_pieces} pieces in {len(jobs)} jobs", flush=True)
 
-    pending = None  # (encode process, segment dir, frames dir, expected frames)
+    # Queue every job that isn't finished; jobs a crashed run left in running/ go back too.
+    for d in ("queue", "running", "workers", "jobs"):
+        (work / d).mkdir(exist_ok=True)
+    for f in (work / "running").glob("*.json"):
+        os.replace(f, work / "queue" / (f.name.split(".")[0] + ".json"))
+    to_encode = []
+    for i, job in enumerate(jobs):
+        d = work / "jobs" / f"j{i:03d}"
+        qf = work / "queue" / f"j{i:03d}.json"
+        if (d / "encoded").exists():
+            qf.unlink(missing_ok=True)
+        elif (d / "done").exists():
+            qf.unlink(missing_ok=True)
+            to_encode.append(i)
+        else:
+            write_json(qf, job_spec(i, job, work, src, info, sq, out, a, settings))
 
-    def finish(p):
-        proc, seg, frames, n = p
-        if proc.wait() != 0:
-            sys.exit(f"x265 encode failed for {seg}")
-        got = frame_count(seg / "video.mkv")
-        if got != n:
-            sys.exit(f"{seg}/video.mkv has {got} frames, expected {n}")
-        (seg / "done").write_text("ok\n")
+    t0 = time.time()
+    workers = Workers()
+    encodes = {}  # job index -> Popen
+    stop = {"why": None}
+
+    def on_signal(signum, _frame):
+        stop["why"] = f"signal {signum}"
+
+    old_handlers = {s: signal.signal(s, on_signal) for s in (signal.SIGINT, signal.SIGTERM)}
+
+    if any((work / "queue").glob("*.json")):
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "VIDEOUPSCALE_DEPS": str(DEPS)}
+        names = ([f"gpu{g.strip()}" for g in a.gpus.split(",") if g.strip()] if eng["gpu"]
+                 else [f"cpu{k}" for k in range(a.workers)])
+        python = str(eng["python"]())
+        for name in names:
+            wenv = dict(env)
+            if eng["gpu"]:
+                wenv["CUDA_VISIBLE_DEVICES"] = name[3:]
+            workers.start(name, show([python, REPO / "engines" / eng["runner"], "--work", work,
+                                      "--worker", name]), wenv, work / "workers" / f"{name}.log")
+
+    def encode_done(i, proc):
+        d = work / "jobs" / f"j{i:03d}"
+        if proc.returncode != 0:
+            raise Abort(f"x265 encode failed for {d}")
+        want = sum(len(plan.written_frames(p)) for p in jobs[i])
+        got = media.frame_count(d / "video.mkv")
+        if got != want:
+            raise Abort(f"{d}/video.mkv has {got} frames, expected {want}")
+        (d / "encoded").write_text("ok\n")
         if not a.keep_frames:
-            shutil.rmtree(frames, ignore_errors=True)
-            (seg / "prep.mp4").unlink(missing_ok=True)
-        print(f"segment {seg.name} encoded ({n} frames)", flush=True)
+            shutil.rmtree(d / "frames", ignore_errors=True)
+            shutil.rmtree(d / "tail", ignore_errors=True)
+        print(f"job j{i:03d} encoded ({got} frames)", flush=True)
 
-    t_all = time.time()
-    gpu_secs = 0.0
-    for i, (s, e) in enumerate(segments):
-        seg = work / f"seg{i:03d}"
-        if (seg / "done").exists():
-            continue
-        seg.mkdir(exist_ok=True)
-        frames = seg / "frames"
-        run(prep_cmd(src, fps, sq, s, e - s, seg / "prep.mp4"))
-        if frame_count(seg / "prep.mp4") != e - s:
-            sys.exit(f"{seg}/prep.mp4 does not have {e - s} frames")
-        if frames.exists():
-            shutil.rmtree(frames)
-        t0 = time.time()
-        run([DEPS / "venv/bin/python", DEPS / "seedvr2/inference_cli.py", seg / "prep.mp4",
-             "--output", frames, "--output_format", "png",
-             "--model_dir", DEPS / "models/SEEDVR2", "--dit_model", a.model,
-             "--resolution", out_h, "--batch_size", a.batch_size,
-             "--temporal_overlap", a.overlap, "--color_correction", a.color_correction,
-             "--attention_mode", a.attention, "--cuda_device", a.gpus], log=seg / "seedvr2.log")
-        secs = time.time() - t0
-        gpu_secs += secs
-        frame_dir, n = frame_dir_of(frames)
-        if n != e - s:
-            sys.exit(f"SeedVR2 wrote {n} frames for {seg}, expected {e - s}")
-        print(f"segment {seg.name}: {n} frames in {secs:.0f} s = {n / secs:.3f} fps", flush=True)
-        (seg / "timing.json").write_text(json.dumps(dict(frames=n, seconds=round(secs, 1)), indent=1))
-        if pending:
-            finish(pending)
-        pending = (subprocess.Popen(show(encode_cmd(frame_dir, fps, a.crf, seg / "video.mkv"))),
-                   seg, frames, n)
-    if pending:
-        finish(pending)
+    frames_total = last - first
+    last_progress = 0
+    try:
+        while True:
+            if (work / "cancel").exists():
+                stop["why"] = "cancel file"
+            if stop["why"]:
+                raise Abort(f"stopped ({stop['why']}); rerun the same command to resume")
+            failed = workers.poll()
+            if failed:
+                raise Abort(f"worker failed: {', '.join(failed)}; see {work / 'workers'}")
+            for i in range(len(jobs)):
+                d = work / "jobs" / f"j{i:03d}"
+                if (d / "done").exists() and not (d / "encoded").exists() and i not in encodes \
+                        and i not in to_encode:
+                    to_encode.append(i)
+            for i, proc in list(encodes.items()):
+                if proc.poll() is not None:
+                    del encodes[i]
+                    encode_done(i, proc)
+            to_encode.sort()
+            while to_encode and len(encodes) < a.encoders:
+                i = to_encode.pop(0)
+                d = work / "jobs" / f"j{i:03d}"
+                encodes[i] = subprocess.Popen(show(media.encode_cmd(d / "frames" / "f*.png", fps, a.crf,
+                                                                    d / "video.mkv", a.x265_preset)))
+            if all((work / "jobs" / f"j{i:03d}" / "encoded").exists() for i in range(len(jobs))):
+                break
+            if not workers.procs and not encodes and not to_encode:
+                pending = [i for i in range(len(jobs)) if not (work / "jobs" / f"j{i:03d}" / "done").exists()]
+                if pending:
+                    raise Abort(f"workers finished but jobs {pending} are not done")
+            if time.time() - last_progress > 5:
+                progress(work, jobs, "processing", t0, frames_total,
+                         dict(jobs_total=len(jobs), encodes_running=len(encodes)))
+                last_progress = time.time()
+            time.sleep(0.5)
+    except Abort as e:
+        workers.stop()
+        for proc in encodes.values():
+            proc.terminate()
+        progress(work, jobs, "stopped", t0, frames_total, dict(message=str(e)))
+        sys.exit(str(e))
+    finally:
+        for s, h in old_handlers.items():
+            signal.signal(s, h)
 
-    # Join segments, then add the source audio for the same range.
+    # Join jobs, then add the source audio for the same range.
     listing = work / "segments.txt"
-    listing.write_text("".join(f"file '{work / f'seg{i:03d}' / 'video.mkv'}'\n" for i in range(len(segments))))
+    listing.write_text("".join(f"file '{work / 'jobs' / f'j{i:03d}' / 'video.mkv'}'\n" for i in range(len(jobs))))
     video = work / "video.mkv"
-    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
+    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0",
          "-i", listing, "-c", "copy", video])
     result = work / "upscaled.mkv"
     whole = first == 0 and last == info["frames"]
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", video]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", video]
     if info["audio"]:
         cut = [] if whole else ["-ss", f"{float(first / fps):.6f}", "-t", f"{float((last - first) / fps):.6f}"]
         # A partial range re-encodes the audio (a stream copy can't cut on our frame boundary).
         acodec = ["-c:a", "copy"] if whole else ["-c:a", "aac", "-b:a", "256k"]
-        cmd += [*cut, "-i", src, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", *acodec, "-shortest"]
+        # No -shortest: it drops video frames when the audio ends a fraction early.
+        cmd += [*cut, "-i", src, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", *acodec]
     else:
         cmd += ["-c", "copy"]
     run([*cmd, result])
-    total = frame_count(result)
+    total = media.frame_count(result)
     print(f"upscaled.mkv: {total} frames (expected {last - first})", flush=True)
-    timing = dict(frames=last - first, segments=len(segments), wall_seconds=round(time.time() - t_all, 1),
-                  seedvr2_seconds_this_run=round(gpu_secs, 1), gpus=a.gpus, model=a.model,
-                  batch_size=a.batch_size, overlap=a.overlap, size=f"{out_w}x{out_h}")
-    (work / "timing.json").write_text(json.dumps(timing, indent=2))
+    if total != last - first:
+        sys.exit("frame count mismatch in upscaled.mkv")
+
+    job_stats = []
+    for i in range(len(jobs)):
+        d = work / "jobs" / f"j{i:03d}"
+        pieces = [json.loads(m.read_text()) for m in sorted((d / "pieces").glob("p*.json"))]
+        done = json.loads((d / "done").read_text()) if (d / "done").exists() else {}
+        job_stats.append(dict(job=f"j{i:03d}", frames=sum(len(plan.written_frames(p)) for p in jobs[i]),
+                              worker=done.get("worker"), seconds=done.get("seconds"), pieces=pieces))
+    timing = dict(frames=last - first, jobs=len(jobs), pieces=n_pieces, scene_cuts=len(cuts),
+                  wall_seconds_this_run=round(time.time() - t0, 1), engine=a.engine, settings=settings,
+                  gpus=a.gpus if eng["gpu"] else None, size=f"{out[0]}x{out[1]}", per_job=job_stats)
+    write_json(work / "timing.json", timing)
+    progress(work, jobs, "done", t0, frames_total)
 
     if a.compare == "yes" or (a.compare == "auto" and (last - first) / fps <= COMPARE_MAX_SECONDS):
-        # Left: plain Lanczos of the source (square pixels, BT.709). Right: SeedVR2.
-        run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-             "-ss", f"{seek_time(first, fps):.6f}", "-i", src, "-i", result, "-filter_complex",
-             f"[0:v]trim=end_frame={last - first},scale={out_w}:{out_h}:flags=lanczos:"
-             f"in_color_matrix=bt601:out_color_matrix=bt709,format=yuv420p,setsar=1[l];"
+        # Left: plain Lanczos of the source (same colour handling as the engines). Right: result.
+        left = media.to_rgb_filter(info, out, a.deinterlace)
+        run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+             "-ss", f"{media.seek_time(first, fps):.6f}", "-i", src, "-i", result, "-filter_complex",
+             f"[0:v]{left},trim=end_frame={last - first},scale=out_color_matrix=bt709:out_range=tv,"
+             f"format=yuv420p,setsar=1[l];"
              f"[1:v]scale=in_color_matrix=bt709:out_color_matrix=bt709,format=yuv420p,setsar=1[r];"
              f"[l][r]hstack=inputs=2[v]", "-map", "[v]",
              "-c:v", "libx264", "-crf", "14", "-preset", "medium", "-colorspace", "bt709",

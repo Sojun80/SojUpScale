@@ -3,3 +3,5 @@ __pycache__/
 *.mkv
 *.png
 work/
+*.log
+eval-out/
