@@ -1,0 +1,29 @@
+{
+ "note": "Candidates for eval/run.py. Each changes one thing from '7b' so differences can be attributed. 'why' says what it tests, not what is expected to win.",
+ "candidates": [
+  {"name": "lanczos", "gpus": 0, "args": ["--engine", "lanczos"],
+   "why": "conventional resize: the floor every model must clearly beat"},
+  {"name": "7b", "args": [],
+   "why": "current defaults: 7B fp16, batch <= 45 balanced per shot, overlap 3, lab colour"},
+  {"name": "7b-sharp", "args": ["--model", "seedvr2_ema_7b_sharp_fp16.safetensors"],
+   "why": "sharp weights (needs thed1/setup.sh seedvr2_ema_7b_sharp_fp16.safetensors)"},
+  {"name": "7b-wavelet", "args": ["--color-correction", "wavelet"],
+   "why": "lab histogram-matches colour per batch; wavelet keeps the source's low frequencies per pixel"},
+  {"name": "7b-nocolor", "args": ["--color-correction", "none"],
+   "why": "the model's own colours, to see what correction changes"},
+  {"name": "7b-ov9", "args": ["--overlap", "9"],
+   "why": "overlap 3 crossfades over one frame; 9 over three, ~17% more frames to compute"},
+  {"name": "7b-b81-ov9", "args": ["--batch-size", "81", "--overlap", "9"],
+   "why": "longer temporal context, fewer seams; check GPU memory"},
+  {"name": "7b-prepend4", "args": ["--prepend-frames", "4"],
+   "why": "mirrored lead-in so a shot's first frames get context"},
+  {"name": "7b-unbalanced", "args": ["--no-balanced-batches"],
+   "why": "isolates the balanced-batch change (upstream's short last batch)"},
+  {"name": "7b-noise", "args": ["--input-noise", "0.1"],
+   "why": "slight input noise, sometimes used on heavily compressed sources"},
+  {"name": "legacy", "gpus": 4,
+   "command": "python3 {repo}/../SojUpScale-legacy/upscale.py {src} --work {work} --gpus {gpu} --compare no --height {height}",
+   "output": "{work}/upscaled.mkv",
+   "why": "the pipeline before this branch (git worktree add ../SojUpScale-legacy d9715b5), 4-GPU split"}
+ ]
+}

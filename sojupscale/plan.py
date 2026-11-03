@@ -84,6 +84,8 @@ def plan_jobs(first, last, cuts, job_frames, max_piece, overlap):
     """List of jobs, each a list of piece dicts (see module docstring)."""
     if job_frames < max_piece:
         raise ValueError("job_frames must be >= max_piece")
+    if not 0 <= 4 * overlap <= max_piece:
+        raise ValueError("overlap must be at most a quarter of max_piece")  # room for both crossfades
     jobs, cur, cur_len = [], [], 0
     for shot_no, (a, b) in enumerate(shots(first, last, cuts)):
         pieces = [_piece(s, e) for s, e in split_shot(a, b, max_piece, overlap)]

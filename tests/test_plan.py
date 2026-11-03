@@ -87,7 +87,7 @@ class PlanJobs(unittest.TestCase):
             last = first + rng.randrange(1, 8000)
             cuts = sorted(rng.sample(range(first, last + 1), min(rng.randrange(0, 40), last - first)))
             max_piece = rng.randrange(20, 700)
-            overlap = rng.randrange(0, min(24, max_piece - 1))
+            overlap = rng.randrange(0, min(24, max_piece // 4) + 1)
             job_frames = max_piece + rng.randrange(0, 2000)
             jobs = plan.plan_jobs(first, last, cuts, job_frames, max_piece, overlap)
             self.assertValid(jobs, first, last, cuts)
@@ -95,6 +95,10 @@ class PlanJobs(unittest.TestCase):
                 self.assertTrue(all(p["end"] - p["start"] <= max_piece for p in job))
                 lo, hi = plan.job_range(job)
                 self.assertLessEqual(hi - lo, job_frames + overlap)
+
+    def test_rejects_overlap_too_large_for_crossfades(self):
+        with self.assertRaises(ValueError):
+            plan.plan_jobs(0, 1000, [], 600, 100, 26)
 
     def test_check_catches_gaps(self):
         jobs = plan.plan_jobs(0, 300, [], 300, 300, 0)
